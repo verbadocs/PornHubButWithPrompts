@@ -21,29 +21,7 @@ echo "[$(date -Iseconds)] Claude session started" >> "${logFile}"
 # Use 'script' to capture the entire terminal session including input
 script -q "${sessionFile}" /opt/homebrew/bin/claude
 
-# Extract only lines that start with "> " (user prompts)
-if [ -f "${sessionFile}" ]; then
-    # Remove ANSI codes and carriage returns, then look for user input
-    cat "${sessionFile}" | \
-    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' | \
-    sed 's/\r//g' | \
-    grep -v '^$' | \
-    grep -v '^Script' | \
-    grep -v 'Hello! How can I' | \
-    grep -v "I'm Claude" | \
-    while IFS= read -r line; do
-        # Only log lines that start with "> " (actual user prompts)
-        if [[ "$line" == "> "* ]]; then
-            # Remove the "> " prefix and add timestamp
-            prompt=\$(echo "$line" | sed 's/^> //')
-            echo "[$(date -Iseconds)] User Prompt: $prompt" >> "${logFile}"
-        fi
-    done
-    
-    # Keep the session file for debugging
-    echo "Session file saved at: ${sessionFile}" >> "${logFile}"
-fi
-
+# Don't process here anymore - processing happens periodically in extension
 echo "[$(date -Iseconds)] Claude session ended" >> "${logFile}"
 `;
         fs.writeFileSync(wrapperScript, wrapperContent);
@@ -55,9 +33,58 @@ echo "[$(date -Iseconds)] Claude session ended" >> "${logFile}"
             shellArgs: [wrapperScript],
         });
         terminal.show();
+        // Track what we've already processed
+        let lastProcessedPosition = 0;
+        // Function to process new prompts from session file
+        const processNewPrompts = () => {
+            if (!fs.existsSync(sessionFile)) {
+                return;
+            }
+            try {
+                const fileContent = fs.readFileSync(sessionFile, "utf8");
+                // Only process content after our last position
+                const newContent = fileContent.substring(lastProcessedPosition);
+                if (newContent.length === 0) {
+                    return;
+                }
+                // Process new lines for prompts
+                const lines = newContent.split("\n");
+                lines.forEach((line) => {
+                    // Remove ANSI codes
+                    const cleanLine = line
+                        .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+                        .replace(/\r/g, "")
+                        .trim();
+                    // Check if it's a user prompt line
+                    if (cleanLine.startsWith("> ") && cleanLine.length > 2) {
+                        const prompt = cleanLine.substring(2);
+                        // Filter out UI hints
+                        if (!prompt.includes("Try") &&
+                            !prompt.includes("<filepath>") &&
+                            prompt.length > 0) {
+                            const timestamp = new Date().toISOString();
+                            fs.appendFileSync(logFile, `[${timestamp}] User Prompt: ${prompt}\n`);
+                        }
+                    }
+                });
+                // Update our position
+                lastProcessedPosition = fileContent.length;
+            }
+            catch (e) {
+                // File might be locked, will retry on next interval
+            }
+        };
+        // Process prompts every 30 seconds
+        const processingInterval = setInterval(processNewPrompts, 5000);
+        // Also process immediately when terminal opens (after a delay)
+        setTimeout(processNewPrompts, 2000);
         // Cleanup on close
         const cleanup = vscode.window.onDidCloseTerminal((t) => {
             if (t === terminal) {
+                // Do final processing before cleanup
+                processNewPrompts();
+                // Clear the interval
+                clearInterval(processingInterval);
                 try {
                     fs.unlinkSync(wrapperScript);
                     fs.unlinkSync(sessionFile);
@@ -66,7 +93,7 @@ echo "[$(date -Iseconds)] Claude session ended" >> "${logFile}"
                 cleanup.dispose();
             }
         });
-        vscode.window.showInformationMessage("Claude Logger started - Claude interface will work and prompts will be logged after session ends!");
+        vscode.window.showInformationMessage("Claude Logger started - prompts will be logged every 30 seconds!");
     });
     const openLogDisposable = vscode.commands.registerCommand("claude-logger.openLog", () => {
         vscode.workspace.openTextDocument(logFile).then((doc) => {
